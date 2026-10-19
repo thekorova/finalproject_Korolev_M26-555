@@ -1,0 +1,29 @@
+[project]
+name = "finalproject-korolev-m26-555"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Thekorova", email = "qwerrewq123123123@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "prettytable>=3.18.0",
+    "requests>=2.34.2",
+]
+
+[project.scripts]
+finalproject-korolev-m26-555 = "valutatrade_hub:main"
+
+[build-system]
+requires = ["uv_build>=0.12.8,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "valutatrade_hub"
+module-root = ""
+
+[dependency-groups]
+dev = [
+    "ruff>=0.17.1",
+]
