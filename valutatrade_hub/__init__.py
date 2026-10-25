@@ -1,2 +1,1 @@
-def main() -> None:
-    print("Hello from finalproject-korolev-m26-555!")
+from valutatrade_hub.cli.interface import main
