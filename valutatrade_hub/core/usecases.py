@@ -2,12 +2,18 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta
 
+from valutatrade_hub.core.currencies import get_currency
+from valutatrade_hub.core.exceptions import ApiRequestError, InsufficientFundsError
 from valutatrade_hub.core.models import PASSWORD_ITERATIONS, Portfolio, User
-from valutatrade_hub.core.utils import load_json, save_json
+from valutatrade_hub.decorators import log_action
+from valutatrade_hub.infra.database import DatabaseManager
+from valutatrade_hub.infra.settings import SettingsLoader
 
 
 def register_user(username, password):
     """Регистрирует нового пользователя и создает пустой портфель"""
+    settings = SettingsLoader()
+    db = DatabaseManager()
     if not isinstance(username, str):
         raise TypeError("Имя пользователя должно быть строкой")
     username = username.strip()
@@ -17,7 +23,7 @@ def register_user(username, password):
         raise TypeError("Пароль должен быть строкой")
     if len(password) < 4:
         raise ValueError("Пароль должен быть не короче 4 символов")
-    users = load_json("data/users.json", [])
+    users = db.load(settings.get("users_path"), [])
     for user in users:
         if user["username"] == username:
             raise ValueError(f"Имя пользователя '{username}' уже занято")
@@ -44,10 +50,10 @@ def register_user(username, password):
         "registration_date": new_user.registration_date.isoformat(),
     }
     users.append(user_data)
-    save_json("data/users.json", users)
-    portfolios = load_json("data/portfolios.json", [])
+    db.save(settings.get("users_path"), users)
+    portfolios = db.load(settings.get("portfolios_path"), [])
     portfolios.append({"user_id": new_user.user_id, "wallets": {}})
-    save_json("data/portfolios.json", portfolios)
+    db.save(settings.get("portfolios_path"), portfolios)
     return (
         f"Пользователь '{username}' зарегистрирован (id={user_id}). "
         f"Войдите: login --username {username} --password {'*' * len(password)}"
@@ -56,7 +62,9 @@ def register_user(username, password):
 
 def login_user(username, password):
     """Проверяет имя пользователя и пароль"""
-    users = load_json("data/users.json", [])
+    settings = SettingsLoader()
+    db = DatabaseManager()
+    users = db.load(settings.get("users_path"), [])
     user_data = next((i for i in users if i["username"] == username), None)
     if user_data is None:
         raise ValueError(f"Пользователь '{username}' не найден")
@@ -74,7 +82,9 @@ def login_user(username, password):
 
 def get_user_portfolio(user: User):
     """Загружает портфель пользователя из json"""
-    portfolios = load_json("data/portfolios.json", [])
+    settings = SettingsLoader()
+    db = DatabaseManager()
+    portfolios = db.load(settings.get("portfolios_path"), [])
     portfolio_data = next((i for i in portfolios if i["user_id"] == user.user_id), None)
     if portfolio_data is None:
         raise ValueError("Портфель пользователя не найден")
@@ -87,7 +97,9 @@ def get_user_portfolio(user: User):
 
 def save_user_portfolio(portfolio: Portfolio):
     """Сохраняет портфель пользователя в json"""
-    portfolios = load_json("data/portfolios.json", [])
+    settings = SettingsLoader()
+    db = DatabaseManager()
+    portfolios = db.load(settings.get("portfolios_path"), [])
     portfolio_data = next(
         (i for i in portfolios if i["user_id"] == portfolio.user.user_id), None
     )
@@ -103,12 +115,14 @@ def save_user_portfolio(portfolio: Portfolio):
         )
     else:
         portfolio_data["wallets"] = wallets
-    save_json("data/portfolios.json", portfolios)
+    db.save(settings.get("portfolios_path"), portfolios)
 
 
 def get_cached_rates():
     """Загружает сохранённые курсы валют из json"""
-    return load_json("data/rates.json", {})
+    settings = SettingsLoader()
+    db = DatabaseManager()
+    return db.load(settings.get("rates_path"), {})
 
 
 def get_exchange_rates():
@@ -124,7 +138,8 @@ def get_exchange_rates():
     return rates
 
 
-def buy_currency(user: User, currency_code, amount):
+@log_action("BUY", verbose=True)
+def buy_currency(user: User, currency_code, amount, container=None):
     """Покупает валюту за USD и сохраняет изменения портфеля"""
     if isinstance(amount, bool) or not isinstance(amount, (int, float)):
         raise TypeError("'amount' должен быть числом")
@@ -133,6 +148,7 @@ def buy_currency(user: User, currency_code, amount):
     if not isinstance(currency_code, str):
         raise TypeError("'currency_code' должен быть строкой")
     currency_code = currency_code.strip().upper()
+    get_currency(currency_code)
     if not currency_code:
         raise ValueError("'currency_code' не может быть пустым")
     if currency_code == "USD":
@@ -141,17 +157,18 @@ def buy_currency(user: User, currency_code, amount):
     if currency_code not in rates:
         raise ValueError(f"Не удалось получить курс для {currency_code}→USD")
     rate = rates[currency_code]
+    if container is not None:
+        container["rate"] = rate
     cost_usd = amount * rate
     portfolio = get_user_portfolio(user)
     try:
         usd_wallet = portfolio.get_wallet("USD")
     except KeyError as error:
         raise ValueError("У пользователя нет USD-кошелька") from error
-    if not cost_usd > 0 or cost_usd > usd_wallet.balance:
-        raise ValueError(
-            f"Недостаточно USD или некорректная стоимость покупки: "
-            f"доступно {usd_wallet.balance:.2f}, требуется {cost_usd:.2f}"
-        )
+    if not cost_usd > 0:
+        raise ValueError("Некорректная стоимость покупки")
+    if cost_usd > usd_wallet.balance:
+        raise InsufficientFundsError(usd_wallet.balance, cost_usd, "USD")
     if currency_code not in portfolio.wallets:
         portfolio.add_currency(currency_code)
     currency_wallet = portfolio.get_wallet(currency_code)
@@ -159,8 +176,12 @@ def buy_currency(user: User, currency_code, amount):
     new_balance = old_balance + amount
     if not new_balance > old_balance:
         raise ValueError("Некорректный баланс после покупки")
+    if container is not None:
+        container["balance_before"] = currency_wallet.balance
     usd_wallet.withdraw(cost_usd)
     currency_wallet.deposit(amount)
+    if container is not None:
+        container["balance_after"] = currency_wallet.balance
     save_user_portfolio(portfolio)
     return (
         f"Покупка выполнена: {amount:.4f} {currency_code} "
@@ -173,16 +194,19 @@ def buy_currency(user: User, currency_code, amount):
 
 
 def rate_refresh(updated_at):
-    """Проверяет, обновлялся ли курс за последние 5 минут."""
+    """Проверяет, актуальность курса по ТТЛ из настроек"""
+    settings = SettingsLoader()
+    ttl = settings.get("rates_ttl_seconds")
     updated_at = datetime.fromisoformat(updated_at)
     now = datetime.now()
-    if timedelta(0) <= now - updated_at < timedelta(minutes=5):
+    if timedelta(0) <= now - updated_at < timedelta(seconds=ttl):
         return True
     else:
         return False
 
 
-def sell_currency(user: User, currency_code, amount):
+@log_action("SELL", verbose=True)
+def sell_currency(user: User, currency_code, amount, container=None):
     """Продает валюту за USD и сохраняет изменения портфеля."""
     if isinstance(amount, bool) or not isinstance(amount, (int, float)):
         raise TypeError("'amount' должен быть числом")
@@ -193,6 +217,7 @@ def sell_currency(user: User, currency_code, amount):
     currency_code = currency_code.strip().upper()
     if not currency_code:
         raise ValueError("'currency_code' не может быть пустым")
+    get_currency(currency_code)
     if currency_code == "USD":
         raise ValueError("Нельзя продавать USD за USD")
     rates = get_exchange_rates()
@@ -202,24 +227,23 @@ def sell_currency(user: User, currency_code, amount):
     try:
         currency_wallet = portfolio.get_wallet(currency_code)
     except KeyError as error:
-        raise ValueError(
-            f"У вас нет кошелька '{currency_code}'. "
-            "Добавьте валюту: она создаётся автоматически при первой покупке."
-        ) from error
+        raise InsufficientFundsError(0, amount, currency_code) from error
     if amount > currency_wallet.balance:
-        raise ValueError(
-            f"Недостаточно средств: доступно "
-            f"{currency_wallet.balance:.4f} {currency_code}, "
-            f"требуется {amount:.4f} {currency_code}"
-        )
+        raise InsufficientFundsError(currency_wallet.balance, amount, currency_code)
     if "USD" not in portfolio.wallets:
         portfolio.add_currency("USD")
     usd_wallet = portfolio.get_wallet("USD")
     rate = rates[currency_code]
+    if container is not None:
+        container["rate"] = rate
     revenue_usd = amount * rate
     old_balance = currency_wallet.balance
+    if container is not None:
+        container["balance_before"] = currency_wallet.balance
     currency_wallet.withdraw(amount)
     usd_wallet.deposit(revenue_usd)
+    if container is not None:
+        container["balance_after"] = currency_wallet.balance
     save_user_portfolio(portfolio)
     return (
         f"Продажа выполнена: {amount:.4f} {currency_code} "
@@ -239,6 +263,8 @@ def plug_rate(currency_code):
 
 def refresh_rate(currency_code):
     """Обновляет курс валюты в JSON через заглушку."""
+    settings = SettingsLoader()
+    db = DatabaseManager()
     rate = plug_rate(currency_code)
     if rate is None:
         return None
@@ -251,7 +277,7 @@ def refresh_rate(currency_code):
     }
     cached_rates["source"] = "Stub"
     cached_rates["last_refresh"] = updated_at
-    save_json("data/rates.json", cached_rates)
+    db.save(settings.get("rates_path"), cached_rates)
     return cached_rates[pair]
 
 
@@ -267,6 +293,8 @@ def get_currency_rate(from_currency, to_currency):
         raise ValueError("'from_currency' не может быть пустым")
     if not to_currency:
         raise ValueError("'to_currency' не может быть пустым")
+    get_currency(from_currency)
+    get_currency(to_currency)
     pair = f"{from_currency}_{to_currency}"
     reverse_pair = f"{to_currency}_{from_currency}"
     cached_rates = get_cached_rates()
@@ -301,9 +329,7 @@ def get_currency_rate(from_currency, to_currency):
             data = refresh_rate(from_currency)
             reverse = False
     if data is None:
-        raise ValueError(
-            f"Курс {from_currency}→{to_currency} недоступен. Повторите попытку позже."
-        )
+        raise ApiRequestError(f"Не удалось получить курс {from_currency}→{to_currency}")
     rate_value = data["rate"]
     updated_at = data["updated_at"]
     if reverse:

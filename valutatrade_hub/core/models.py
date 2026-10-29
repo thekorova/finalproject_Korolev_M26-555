@@ -4,6 +4,8 @@ import math
 import secrets
 from datetime import datetime
 
+from valutatrade_hub.core.exceptions import InsufficientFundsError
+
 PASSWORD_ITERATIONS = 600000
 
 
@@ -158,7 +160,7 @@ class Wallet:
         if amount <= 0:
             raise ValueError("Сумма вывода не может быть отрицательным")
         if self.balance < amount:
-            raise ValueError("Недостаточно средств на балансе")
+            raise InsufficientFundsError(self.balance, amount, self.currency_code)
         self.balance -= amount
 
 

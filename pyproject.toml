@@ -35,3 +35,12 @@ exclude = ["venv", ".venv", "dist", "__pycache__"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "B"]
+
+[tool.valutatrade]
+users_path = "data/users.json"
+portfolios_path = "data/portfolios.json"
+rates_path = "data/rates.json"
+rates_ttl_seconds = 300
+base_currency = "USD"
+log_format = "text"
+log_path = "logs/actions.log"
