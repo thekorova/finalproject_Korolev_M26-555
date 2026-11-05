@@ -17,6 +17,7 @@ def load_json(filepath, default):
 def save_json(filepath, data):
     """Атомарно сохраняет данные в JSON."""
     filepath = Path(filepath)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
     temp_path = filepath.with_suffix(".json.tmp")
     try:
         with open(temp_path, "w", encoding="utf-8") as file:
