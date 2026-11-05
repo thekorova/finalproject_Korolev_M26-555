@@ -223,3 +223,15 @@ __marimo__/
 logs/
 .env.*
 !.env.example
+
+# WSL environment
+.venv-wsl/
+
+# Asciinema
+*.cast
+
+# Local data
+/data/users.json
+/data/portfolios.json
+/data/rates.json
+/data/exchange_rates.json

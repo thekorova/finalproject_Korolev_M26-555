@@ -1,7 +1,7 @@
 [project]
 name = "finalproject-korolev-m26-555"
 version = "0.1.0"
-description = "Add your description here"
+description = "Платформа для отслеживания и симуляции торговли валютами"
 readme = "README.md"
 authors = [
     { name = "Thekorova", email = "qwerrewq123123123@gmail.com" }

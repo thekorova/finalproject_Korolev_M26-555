@@ -1,6 +1,6 @@
 import hashlib
 import secrets
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from valutatrade_hub.core.currencies import get_currency
 from valutatrade_hub.core.exceptions import ApiRequestError, InsufficientFundsError
@@ -8,6 +8,12 @@ from valutatrade_hub.core.models import PASSWORD_ITERATIONS, Portfolio, User
 from valutatrade_hub.decorators import log_action
 from valutatrade_hub.infra.database import DatabaseManager
 from valutatrade_hub.infra.settings import SettingsLoader
+from valutatrade_hub.parser_service import storage
+from valutatrade_hub.parser_service.api_clients import (
+    CoinGeckoClient,
+    ExchangeRateApiClient,
+)
+from valutatrade_hub.parser_service.updater import RatesUpdater
 
 
 def register_user(username, password):
@@ -125,16 +131,28 @@ def get_cached_rates():
     return db.load(settings.get("rates_path"), {})
 
 
-def get_exchange_rates():
-    """Возвращает курсы валют относительно USD."""
-    cached_rates = get_cached_rates()
-    rates = {"USD": 1.0}
-
-    for k, v in cached_rates.items():
-        if k.endswith("_USD"):
-            currency_code = k.split("_")[0]
-            rates[currency_code] = v["rate"]
-
+def get_exchange_rates(currency_code=None):
+    """Возвращает актуальные курсы валют относительно базовой валюты"""
+    settings = SettingsLoader()
+    base = settings.get("base_currency")
+    pairs = get_cached_rates().get("pairs", {})
+    rates = {base: 1.0}
+    if currency_code is not None:
+        pair = f"{currency_code}_{base}"
+        data = pairs.get(pair)
+        if data is None or not rate_refresh(data["updated_at"]):
+            refresh_rate()
+            pairs = get_cached_rates().get("pairs", {})
+            data = pairs.get(pair)
+        if data is None or not rate_refresh(data["updated_at"]):
+            raise ApiRequestError(f"Не удалось получить актуальный курс {pair}")
+    for k, v in pairs.items():
+        if not k.endswith(f"_{base}"):
+            continue
+        if not rate_refresh(v["updated_at"]):
+            continue
+        code = k.split("_")[0]
+        rates[code] = v["rate"]
     return rates
 
 
@@ -153,7 +171,7 @@ def buy_currency(user: User, currency_code, amount, container=None):
         raise ValueError("'currency_code' не может быть пустым")
     if currency_code == "USD":
         raise ValueError("Нельзя покупать USD за USD")
-    rates = get_exchange_rates()
+    rates = get_exchange_rates(currency_code)
     if currency_code not in rates:
         raise ValueError(f"Не удалось получить курс для {currency_code}→USD")
     rate = rates[currency_code]
@@ -197,8 +215,8 @@ def rate_refresh(updated_at):
     """Проверяет, актуальность курса по ТТЛ из настроек"""
     settings = SettingsLoader()
     ttl = settings.get("rates_ttl_seconds")
-    updated_at = datetime.fromisoformat(updated_at)
-    now = datetime.now()
+    updated_at = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+    now = datetime.now(timezone.utc)
     if timedelta(0) <= now - updated_at < timedelta(seconds=ttl):
         return True
     else:
@@ -220,7 +238,7 @@ def sell_currency(user: User, currency_code, amount, container=None):
     get_currency(currency_code)
     if currency_code == "USD":
         raise ValueError("Нельзя продавать USD за USD")
-    rates = get_exchange_rates()
+    rates = get_exchange_rates(currency_code)
     if currency_code not in rates:
         raise ValueError(f"Не удалось получить курс для {currency_code}→USD")
     portfolio = get_user_portfolio(user)
@@ -255,30 +273,11 @@ def sell_currency(user: User, currency_code, amount, container=None):
     )
 
 
-def plug_rate(currency_code):
-    """Возвращает тестовый курс валюты относительно USD."""
-    rates = {"EUR": 1.0786, "BTC": 59337.21, "RUB": 0.01016, "ETH": 3720.0}
-    return rates.get(currency_code)
-
-
-def refresh_rate(currency_code):
-    """Обновляет курс валюты в JSON через заглушку."""
-    settings = SettingsLoader()
-    db = DatabaseManager()
-    rate = plug_rate(currency_code)
-    if rate is None:
-        return None
-    cached_rates = get_cached_rates()
-    pair = f"{currency_code}_USD"
-    updated_at = datetime.now().isoformat(timespec="seconds")
-    cached_rates[pair] = {
-        "rate": rate,
-        "updated_at": updated_at,
-    }
-    cached_rates["source"] = "Stub"
-    cached_rates["last_refresh"] = updated_at
-    db.save(settings.get("rates_path"), cached_rates)
-    return cached_rates[pair]
+def refresh_rate():
+    """Обновляет курсы валют через Parser Service"""
+    clients = [CoinGeckoClient(), ExchangeRateApiClient()]
+    updater = RatesUpdater(clients=clients, storage=storage)
+    updater.run_update()
 
 
 def get_currency_rate(from_currency, to_currency):
@@ -295,49 +294,34 @@ def get_currency_rate(from_currency, to_currency):
         raise ValueError("'to_currency' не может быть пустым")
     get_currency(from_currency)
     get_currency(to_currency)
-    pair = f"{from_currency}_{to_currency}"
-    reverse_pair = f"{to_currency}_{from_currency}"
+    settings = SettingsLoader()
+    base = settings.get("base_currency")
     cached_rates = get_cached_rates()
-    data = None
-    reverse = False
-    for k in [pair, reverse_pair]:
-        if k in cached_rates:
-            rate_data = cached_rates[k]
-            if "rate" in rate_data and "updated_at" in rate_data:
-                rate_value = rate_data["rate"]
-
-                if (
-                    isinstance(rate_value, (int, float))
-                    and not isinstance(rate_value, bool)
-                    and rate_value > 0
-                ):
-                    try:
-                        if rate_refresh(rate_data["updated_at"]):
-                            data = rate_data
-
-                            if k == reverse_pair:
-                                reverse = True
-
-                            break
-                    except (ValueError, TypeError):
-                        pass
-    if data is None:
-        if from_currency == "USD" and to_currency != "USD":
-            data = refresh_rate(to_currency)
-            reverse = True
-        elif to_currency == "USD" and from_currency != "USD":
-            data = refresh_rate(from_currency)
-            reverse = False
-    if data is None:
-        raise ApiRequestError(f"Не удалось получить курс {from_currency}→{to_currency}")
-    rate_value = data["rate"]
-    updated_at = data["updated_at"]
-    if reverse:
-        rate = 1 / rate_value
-        re_rate = rate_value
+    rates = cached_rates.get("pairs", {})
+    for i in [from_currency, to_currency]:
+        if i == base:
+            continue
+        pair = f"{i}_{base}"
+        data = rates.get(pair)
+        if data is None or not rate_refresh(data["updated_at"]):
+            refresh_rate()
+            cached_rates = get_cached_rates()
+            rates = cached_rates.get("pairs", {})
+            data = rates.get(pair)
+        if data is None or not rate_refresh(data["updated_at"]):
+            raise ApiRequestError(
+                f"Не удалось получить курс {from_currency}→{to_currency}"
+            )
+    if from_currency == base:
+        from_rate = 1
     else:
-        rate = rate_value
-        re_rate = 1 / rate_value
+        from_rate = rates[f"{from_currency}_{base}"]["rate"]
+    if to_currency == base:
+        to_rate = 1
+    else:
+        to_rate = rates[f"{to_currency}_{base}"]["rate"]
+    rate = from_rate / to_rate
+    re_rate = 1 / rate
     if rate < 1:
         rate_text = f"{rate:.8f}"
     else:
@@ -346,7 +330,11 @@ def get_currency_rate(from_currency, to_currency):
         re_rate_text = f"{re_rate:.8f}"
     else:
         re_rate_text = f"{re_rate:.2f}"
-    updated_at = updated_at.replace("T", " ")
+    updated_at = cached_rates.get("last_refresh")
+    if updated_at is not None:
+        updated_at = updated_at.replace("T", " ")
+    else:
+        updated_at = "нет данных"
     return (
         f"Курс {from_currency}→{to_currency}: {rate_text} "
         f"(обновлено: {updated_at})\n"
